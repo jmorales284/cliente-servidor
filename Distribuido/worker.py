@@ -3,6 +3,7 @@ import socket
 import pickle
 import struct
 from keras.datasets import mnist
+import argparse
 
 # ------------------------------------------------------------
 # Funciones de la red neuronal (deben coincidir con el servidor)
@@ -94,11 +95,17 @@ def recv_message(sock):
 # ------------------------------------------------------------
 # Conectar al servidor y recibir la partición
 # ------------------------------------------------------------
-PINGGY_HOST = 'sqntz-2800-e2-627f-fbf9-7ea7-c26d-c88f-885c.a.free.pinggy.link'
-PINGGY_PORT = 36559
+parser = argparse.ArgumentParser(description = 'worker distribuido')
+parser.add_argument('--host', type=str, required=True, help='IP o hostname del servidor')
+parser.add_argument('--port', type=int, default=5000, help='Puerto del servidor')
+
+args = parser.parse_args()
+
+SERVER_HOST= args.host
+SERVER_PORT= args.port
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect((PINGGY_HOST, PINGGY_PORT))
+sock.connect((SERVER_HOST, SERVER_PORT))
 print("Conectado al servidor. Recibiendo partición...")
 
 # Recibir índices de la partición
