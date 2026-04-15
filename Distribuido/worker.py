@@ -1,158 +1,246 @@
-import numpy as np
-import socket
-import pickle
-import struct
-from keras.datasets import mnist
 import argparse
+import io
+import pickle
+import socket
+import struct
+import time
+from typing import Any, List
 
-# ------------------------------------------------------------
-# Funciones de la red neuronal (deben coincidir con el servidor)
-# ------------------------------------------------------------
-INPUT_SIZE = 784
-HIDDEN_SIZE = 72
-OUTPUT_SIZE = 10
+import psutil
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, DistributedSampler
+import torchvision
+import torchvision.transforms as T
 
-def relu(z):
-    return np.maximum(0, z)
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision('high')
 
-def relu_derivative(z):
-    return (z > 0).astype(float)
-
-def softmax(z):
-    exp_z = np.exp(z - np.max(z, axis=1, keepdims=True))
-    return exp_z / np.sum(exp_z, axis=1, keepdims=True)
-
-def forward(X, params):
-    W1, b1, W2, b2 = params['W1'], params['b1'], params['W2'], params['b2']
-    z1 = np.dot(X, W1) + b1
-    a1 = relu(z1)
-    z2 = np.dot(a1, W2) + b2
-    a2 = softmax(z2)
-    cache = {'z1': z1, 'a1': a1, 'z2': z2, 'a2': a2}
-    return a2, cache
-
-def compute_loss(y_pred, y_true):
-    m = y_true.shape[0]
-    loss = -np.sum(y_true * np.log(y_pred + 1e-8)) / m
-    return loss
-
-def backward(X, y, params, cache):
-    m = X.shape[0]
-    W2 = params['W2']
-    a1, z1, a2 = cache['a1'], cache['z1'], cache['a2']
-
-    dz2 = a2 - y
-    dW2 = np.dot(a1.T, dz2) / m
-    db2 = np.sum(dz2, axis=0, keepdims=True) / m
-
-    da1 = np.dot(dz2, W2.T)
-    dz1 = da1 * relu_derivative(z1)
-
-    dW1 = np.dot(X.T, dz1) / m
-    db1 = np.sum(dz1, axis=0, keepdims=True) / m
-
-    grads = {'dW1': dW1, 'db1': db1, 'dW2': dW2, 'db2': db2}
-    return grads
-
-def update_parameters(params, grads, learning_rate):
-    params['W1'] -= learning_rate * grads['dW1']
-    params['b1'] -= learning_rate * grads['db1']
-    params['W2'] -= learning_rate * grads['dW2']
-    params['b2'] -= learning_rate * grads['db2']
-    return params
-
-def one_hot(y, num_classes=10):
-    one_hot_matrix = np.zeros((len(y), num_classes))
-    one_hot_matrix[np.arange(len(y)), y] = 1
-    return one_hot_matrix
-
-# ------------------------------------------------------------
-# Comunicación
-# ------------------------------------------------------------
-def send_message(sock, obj):
-    data = pickle.dumps(obj)
-    length = len(data)
-    sock.sendall(struct.pack('!I', length))
+# ---------------------------
+# Funciones de red (igual que en el servidor, usar send_tensor/recv_tensor)
+# ---------------------------
+def send_tensor(sock: socket.socket, obj: Any) -> None:
+    import io
+    if isinstance(obj, torch.Tensor):
+        buffer = io.BytesIO()
+        torch.save(obj, buffer)
+        data = buffer.getvalue()
+    else:
+        data = pickle.dumps(obj, protocol=4)
+    sock.sendall(struct.pack("!Q", len(data)))
     sock.sendall(data)
 
-def recv_all(sock, n):
-    data = b''
-    while len(data) < n:
-        packet = sock.recv(n - len(data))
-        if not packet:
-            return None
-        data += packet
-    return data
+def recv_tensor(sock: socket.socket) -> Any:
+    def recvall(n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("Conexión cerrada")
+            buf.extend(chunk)
+        return bytes(buf)
+    raw_len = recvall(8)
+    (length,) = struct.unpack("!Q", raw_len)
+    data = recvall(length)
+    try:
+        buffer = io.BytesIO(data)
+        return torch.load(buffer)
+    except:
+        return pickle.loads(data)
 
-def recv_message(sock):
-    raw_length = recv_all(sock, 4)
-    if not raw_length:
-        return None
-    length = struct.unpack('!I', raw_length)[0]
-    data = recv_all(sock, length)
-    return pickle.loads(data)
+send_obj = send_tensor
+recv_obj = recv_tensor
 
-# ------------------------------------------------------------
-# Conectar al servidor y recibir la partición
-# ------------------------------------------------------------
-parser = argparse.ArgumentParser(description = 'worker distribuido')
-parser.add_argument('--host', type=str, required=True, help='IP o hostname del servidor')
-parser.add_argument('--port', type=int, default=5000, help='Puerto del servidor')
+# ---------------------------
+# Modelo (idéntico)
+# ---------------------------
+class Cifar10CNN(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Dropout(0.5)
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 8 * 8, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, 100),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(100, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, num_classes)
+        )
 
-args = parser.parse_args()
+    def forward(self, x):
+        return self.classifier(self.features(x))
 
-SERVER_HOST= args.host
-SERVER_PORT= args.port
+# ---------------------------
+# DataLoader
+# ---------------------------
+def build_dataloader(rank, world_size, batch_size):
+    transform = T.Compose([
+        T.ToTensor(),
+        T.Normalize(mean=(0.4914, 0.4822, 0.4465),
+                    std=(0.2470, 0.2435, 0.2616)),
+    ])
+    train_set = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+    sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+    loader = DataLoader(train_set, batch_size=batch_size, sampler=sampler, num_workers=0, pin_memory=True)
+    return loader, sampler
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect((SERVER_HOST, SERVER_PORT))
-print("Conectado al servidor. Recibiendo partición...")
+# ---------------------------
+# Worker principal con acumulación local
+# ---------------------------
+def run_worker(server_host, server_port, rank, world_size, batch_size, device_str=None):
+    device = torch.device(device_str if device_str else ("cuda" if torch.cuda.is_available() else "cpu"))
+    print(f"[Worker {rank}] Usando dispositivo: {device}")
 
-# Recibir índices de la partición
-indices_particion = recv_message(sock)
-# Recibir learning rate
-learning_rate = recv_message(sock)
-print(f"Partición recibida: {len(indices_particion)} ejemplos")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((server_host, server_port))
+    print(f"[Worker {rank}] Conectado a PS {server_host}:{server_port}")
 
-# ------------------------------------------------------------
-# Cargar datos completos (para extraer la partición)
-# ------------------------------------------------------------
-(train_images, train_labels), (_, _) = mnist.load_data()
-x_train = train_images.reshape(train_images.shape[0], -1) / 255.0
-y_train = one_hot(train_labels)
+    # Registro
+    send_obj(sock, {"type": "register", "rank": rank, "world_size": world_size})
+    cfg = recv_obj(sock)
+    assert cfg["type"] == "config"
+    param_names = cfg["param_names"]
+    epochs = cfg["epochs"]
+    steps_per_epoch = cfg["steps_per_epoch"]    # número de actualizaciones (envíos) por época
+    lr = cfg["lr"]
+    server_step = cfg["step"]
+    accumulation_steps = cfg.get("accumulation_steps", 1)   # cuántos batches acumular localmente
 
-# Extraer la partición asignada
-x_part = x_train[indices_particion]
-y_part = y_train[indices_particion]
+    model = Cifar10CNN().to(device)
+    state_dict_cpu = cfg["state_dict"]
+    model.load_state_dict({k: v.to(device) for k, v in state_dict_cpu.items()})
+    criterion = nn.CrossEntropyLoss()
 
-print(f"Datos cargados. Partición de tamaño: {x_part.shape[0]}")
+    train_loader, sampler = build_dataloader(rank, world_size, batch_size)
+    data_iter = iter(train_loader)
 
-# ------------------------------------------------------------
-# Bucle principal: recibir parámetros, entrenar una época, devolver
-# ------------------------------------------------------------
-while True:
-    # Recibir parámetros globales
-    params = recv_message(sock)
-    if params is None:
-        print("Servidor cerró conexión.")
-        break
+    total_updates = epochs * steps_per_epoch   # número de veces que enviaremos gradientes
+    local_batches_processed = 0
 
-    # Entrenar una época completa sobre la partición (puedes usar mini-batches internamente)
-    # Aquí implementamos un entrenamiento sencillo: una época = un solo paso con todos los datos
-    # (Equivalente a batch gradient descent en la partición)
-    # Si quieres usar mini-batches, deberías hacer un bucle interno.
+    # Para acumulación local: guardamos gradientes acumulados y suma de pérdidas
+    accumulated_grads = [torch.zeros_like(p, device="cpu") for p in model.parameters()]
+    accumulated_samples = 0
+    accumulated_loss = 0.0
+    accumulation_counter = 0
 
-    # Forward con todos los datos de la partición
-    a2, cache = forward(x_part, params)
-    loss = compute_loss(a2, y_part)
+    for epoch in range(epochs):
+        sampler.set_epoch(epoch)
+        data_iter = iter(train_loader)
 
-    # Backward
-    grads = backward(x_part, y_part, params, cache)
+        for update_step in range(steps_per_epoch):
+            # Acumular accumulation_steps batches localmente
+            for _ in range(accumulation_steps):
+                try:
+                    x, y = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(train_loader)
+                    x, y = next(data_iter)
 
-    # Actualizar parámetros localmente (una época = una actualización con todos los datos)
-    params_actualizados = update_parameters(params, grads, learning_rate)
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
 
-    # Enviar los parámetros actualizados al servidor, junto con la pérdida y número de muestras
-    send_message(sock, (params_actualizados, loss, len(x_part)))
+                model.train()
+                # Zero gradientes del modelo ANTES del backward (no usar optimizer, manual)
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad = None
 
-sock.close()
+                logits = model(x)
+                loss = criterion(logits, y)
+                loss.backward()
+
+                # Acumular gradientes (en CPU) y pérdida
+                with torch.no_grad():
+                    for i, p in enumerate(model.parameters()):
+                        if p.grad is not None:
+                            accumulated_grads[i] += p.grad.detach().cpu() * x.size(0)
+                    accumulated_samples += x.size(0)
+                    accumulated_loss += loss.item() * x.size(0)
+                accumulation_counter += 1
+
+            # Después de accumulation_steps, enviamos los gradientes acumulados al servidor
+            # Convertir gradientes acumulados a lista (en CPU)
+            grads_to_send = [g.clone() for g in accumulated_grads]
+
+            # Enviar mensaje con gradientes y pérdida acumulada
+            avg_loss = accumulated_loss / accumulated_samples
+            send_obj(sock, {
+                "type": "gradients",
+                "worker": rank,
+                "step": server_step,
+                "batch_size": accumulated_samples,   # tamaño efectivo del batch enviado
+                "grads": grads_to_send,
+                "loss": avg_loss
+            })
+
+            # Resetear acumuladores locales
+            for g in accumulated_grads:
+                g.zero_()
+            accumulated_samples = 0
+            accumulated_loss = 0.0
+            accumulation_counter = 0
+
+            # Esperar respuesta del servidor
+            resp = recv_obj(sock)
+            rtype = resp.get("type")
+
+            if rtype == "update":
+                state_cpu = resp["state_dict"]
+                model.load_state_dict({k: v.to(device) for k, v in state_cpu.items()})
+                server_step = resp["step"]
+                local_batches_processed += accumulation_steps
+                if local_batches_processed % (steps_per_epoch * accumulation_steps) == 0:
+                    print(f"[Worker {rank}] Época {epoch+1} completada")
+            elif rtype == "resync":
+                state_cpu = resp["state_dict"]
+                model.load_state_dict({k: v.to(device) for k, v in state_cpu.items()})
+                server_step = resp["step"]
+                print(f"[Worker {rank}] Resync, reintentando step")
+                # No incrementamos local_batches_processed, reintentamos el mismo step
+                continue
+            elif rtype == "stop":
+                print(f"[Worker {rank}] Detenido por PS")
+                send_obj(sock, {"type": "done"})
+                sock.close()
+                return
+            else:
+                raise RuntimeError(f"Respuesta desconocida: {rtype}")
+
+    # Fin del entrenamiento
+    print(f"[Worker {rank}] Entrenamiento completado")
+    send_obj(sock, {"type": "done"})
+    sock.close()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--server-host", type=str, default="127.0.0.1")
+    parser.add_argument("--server-port", type=int, default=5000)
+    parser.add_argument("--rank", type=int, required=True)
+    parser.add_argument("--world-size", type=int, required=True)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--device", type=str, default=None)
+    args = parser.parse_args()
+    run_worker(
+        server_host=args.server_host,
+        server_port=args.server_port,
+        rank=args.rank,
+        world_size=args.world_size,
+        batch_size=args.batch_size,
+        device_str=args.device
+    )
+
+if __name__ == "__main__":
+    main()
